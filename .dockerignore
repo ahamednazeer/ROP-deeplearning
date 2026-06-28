@@ -1,0 +1,37 @@
+# Git
+.git
+.gitignore
+
+# Frontend
+frontend/node_modules
+frontend/.next
+frontend/out
+frontend/build
+.next
+
+# Python caches
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+
+# Data / Uploads (Prevents copying local state to container)
+backend/rop.db
+backend/uploads/
+
+# Reference materials & raw notebooks (Saves huge amounts of build context)
+*.ipynb
+*.docx
+frontend-ref/
+
+# Environment Variables
+.env
+.env.*
+backend/.env
+frontend/.env
+
+# IDE & OS
+.idea
+.vscode
+*.swp
+.DS_Store

@@ -1,0 +1,55 @@
+version: '3.9'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: rop-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - SECRET_KEY=${SECRET_KEY:-rop-detection-secret-key-change-in-production-2024}
+      - MODEL_PATH=/app/best.pth
+      - DATABASE_URL=sqlite:////app/data/rop.db
+    volumes:
+      - ./best.pth:/app/best.pth:ro
+      - rop-uploads:/app/uploads
+      - rop-db:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/docs')\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - rop-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=http://localhost:8000
+    container_name: rop-frontend
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - rop-network
+
+volumes:
+  rop-uploads:
+    driver: local
+  rop-db:
+    driver: local
+
+networks:
+  rop-network:
+    driver: bridge

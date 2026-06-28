@@ -1,0 +1,442 @@
+import os, glob, random, warnings
+warnings.filterwarnings('ignore')
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from PIL import Image
+from sklearn.metrics import (classification_report, confusion_matrix,
+                             roc_auc_score, cohen_kappa_score)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Device : {device}")
+for i in range(torch.cuda.device_count()):
+    p = torch.cuda.get_device_properties(i)
+    print(f"  GPU {i}: {p.name} | {p.total_memory/1e9:.1f} GB")
+
+SEED = 42
+random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+print("Ready.")
+
+patients = df['patient_id'].unique()
+np.random.shuffle(patients)
+
+n_test  = max(2, int(len(patients)*0.10))
+n_val   = max(2, int(len(patients)*0.10))
+
+test_pats  = set(patients[:n_test])
+val_pats   = set(patients[n_test:n_test+n_val])
+train_pats = set(patients[n_test+n_val:])
+
+df_train = df[df['patient_id'].isin(train_pats)].reset_index(drop=True)
+df_val   = df[df['patient_id'].isin(val_pats)].reset_index(drop=True)
+df_test  = df[df['patient_id'].isin(test_pats)].reset_index(drop=True)
+
+print(f"Train: {len(df_train)} | Val: {len(df_val)} | Test: {len(df_test)}")
+
+def class_weights(series, n):
+    c = np.bincount(series.astype(int), minlength=n).astype(float)
+    c = np.where(c==0, 1, c)
+    return torch.tensor(len(series)/(n*c), dtype=torch.float32)
+
+CFG.STAGE_WEIGHTS = class_weights(df_train['stage_label'], CFG.N_STAGES)
+CFG.ZONE_WEIGHTS  = class_weights(df_train['zone_label'],  CFG.N_ZONES)
+CFG.PLUS_WEIGHTS  = class_weights(df_train['plus_label'],  CFG.N_PLUS)
+
+print("Stage w:", CFG.STAGE_WEIGHTS.numpy().round(3))
+print("Zone  w:", CFG.ZONE_WEIGHTS.numpy().round(3))
+print("Plus  w:", CFG.PLUS_WEIGHTS.numpy().round(3))
+
+class ROPDataset(Dataset):
+    def __init__(self, dataframe, transform=None):
+        self.df = dataframe.reset_index(drop=True)
+        self.transform = transform
+
+    def __len__(self): return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        try:
+            img = Image.open(row['filepath']).convert('RGB')
+        except:
+            img = Image.new('RGB', (CFG.IMG_SIZE, CFG.IMG_SIZE), 0)
+        if self.transform:
+            img = self.transform(img)
+        meta  = torch.tensor([float(row['gestational_age']),
+                               float(row['birth_weight']),
+                               float(row['sex'])], dtype=torch.float32)
+        stage = torch.tensor(int(row['stage_label']), dtype=torch.long)
+        zone  = torch.tensor(int(row['zone_label']),  dtype=torch.long)
+        plus  = torch.tensor(int(row['plus_label']),  dtype=torch.long)
+        return img, meta, stage, zone, plus
+
+MEAN = [0.485,0.456,0.406]
+STD  = [0.229,0.224,0.225]
+
+train_tf = transforms.Compose([
+    transforms.Resize((CFG.IMG_SIZE, CFG.IMG_SIZE)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD),
+])
+val_tf = transforms.Compose([
+    transforms.Resize((CFG.IMG_SIZE, CFG.IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(MEAN, STD),
+])
+
+train_loader = DataLoader(ROPDataset(df_train, train_tf),
+    batch_size=CFG.BATCH_SIZE, shuffle=True,  num_workers=2, pin_memory=True)
+val_loader   = DataLoader(ROPDataset(df_val,   val_tf),
+    batch_size=CFG.BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+test_loader  = DataLoader(ROPDataset(df_test,  val_tf),
+    batch_size=CFG.BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+print(f"Train: {len(train_loader)} batches")
+print(f"Val  : {len(val_loader)} batches")
+print(f"Test : {len(test_loader)} batches")
+
+imgs, metas, s, z, p = next(iter(train_loader))
+print(f"Batch shape: {imgs.shape} | Meta: {metas.shape}")
+
+class DualStreamBackbone(nn.Module):
+    """
+    Stream A: EfficientNet-B3 — local vessel texture
+    Stream B: Swin-Tiny       — global context (T4-stable, no alignment issues)
+    Output  : LayerNorm(concat) → (B, 1024)
+    """
+    def __init__(self):
+        super().__init__()
+
+        # ── Stream A: EfficientNet-B3 ─────────────────────────────────────────
+        eff = models.efficientnet_b3(weights='IMAGENET1K_V1')
+        in_eff = eff.classifier[1].in_features
+        eff.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(in_eff, CFG.CNN_DIM),
+            nn.GELU()
+        )
+        self.cnn = eff
+
+        # ── Stream B: Swin-Tiny ───────────────────────────────────────────────
+        swin = models.swin_t(weights='IMAGENET1K_V1')
+        in_swin = swin.head.in_features
+        swin.head = nn.Sequential(
+            nn.Linear(in_swin, CFG.VIT_DIM),
+            nn.GELU(),
+            nn.Dropout(0.3)
+        )
+        self.vit = swin
+
+        self.norm = nn.LayerNorm(CFG.FUSED_DIM)
+
+    def forward(self, x):
+        f_cnn = self.cnn(x)
+        f_vit = self.vit(x)
+        return self.norm(torch.cat([f_cnn, f_vit], dim=1)), f_cnn, f_vit
+
+# Quick test
+_b = DualStreamBackbone().to(device)
+_x = torch.randn(2, 3, CFG.IMG_SIZE, CFG.IMG_SIZE, device=device)
+with torch.no_grad():
+    _o, _c, _v = _b(_x)
+print(f"Fused: {_o.shape} | CNN: {_c.shape} | ViT: {_v.shape}")
+del _b, _x, _o, _c, _v
+torch.cuda.empty_cache()
+print("Backbone OK.")
+
+class CTAFModule(nn.Module):
+    def __init__(self, dim=CFG.CTAF_DIM):
+        super().__init__()
+        self.scale  = dim ** -0.5
+        self.norm_s = nn.LayerNorm(dim)
+        self.norm_z = nn.LayerNorm(dim)
+        self.norm_p = nn.LayerNorm(dim)
+
+    def _attend(self, q, keys):
+        K = torch.stack(keys, dim=1)
+        w = F.softmax(torch.bmm(q.unsqueeze(1),
+                      K.transpose(1,2)) * self.scale, dim=-1)
+        return torch.bmm(w, K).squeeze(1)
+
+    def forward(self, Hs, Hz, Hp):
+        return (self.norm_s(Hs + self._attend(Hs, [Hz, Hp])),
+                self.norm_z(Hz + self._attend(Hz, [Hs, Hp])),
+                self.norm_p(Hp + self._attend(Hp, [Hs, Hz])))
+
+_c = CTAFModule().to(device)
+_h = [torch.randn(4, CFG.CTAF_DIM, device=device) for _ in range(3)]
+with torch.no_grad():
+    fs, fz, fp = _c(*_h)
+print(f"CTAF: {fs.shape} {fz.shape} {fp.shape}")
+del _c, _h, fs, fz, fp
+print("CTAF OK.")
+
+class MetadataGate(nn.Module):
+    def __init__(self, feat_dim=CFG.CTAF_DIM, meta_dim=CFG.META_DIM):
+        super().__init__()
+        self.gate      = nn.Sequential(
+            nn.Linear(feat_dim + meta_dim, feat_dim), nn.Sigmoid())
+        self.meta_proj = nn.Sequential(
+            nn.Linear(meta_dim, feat_dim), nn.GELU())
+        self.norm = nn.LayerNorm(feat_dim)
+
+    def forward(self, feat, meta):
+        g = self.gate(torch.cat([feat, meta], dim=1))
+        return self.norm(g * feat + (1-g) * self.meta_proj(meta))
+
+_g = MetadataGate().to(device)
+_f = torch.randn(4, CFG.CTAF_DIM, device=device)
+_m = torch.randn(4, CFG.META_DIM, device=device)
+with torch.no_grad():
+    _o = _g(_f, _m)
+print(f"Gate output: {_o.shape}")
+del _g, _f, _m, _o
+print("MetadataGate OK.")
+
+class MTL_CTAF_ROP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone   = DualStreamBackbone()
+        proj = lambda: nn.Sequential(
+            nn.Linear(CFG.FUSED_DIM, 512), nn.GELU(), nn.Dropout(CFG.DROPOUT),
+            nn.Linear(512, CFG.CTAF_DIM),  nn.GELU())
+        self.proj_s     = proj()
+        self.proj_z     = proj()
+        self.proj_p     = proj()
+        self.ctaf       = CTAFModule()
+        self.gate_s     = MetadataGate()
+        self.gate_z     = MetadataGate()
+        self.gate_p     = MetadataGate()
+        self.drop       = nn.Dropout(CFG.DROPOUT)
+        self.clf_stage  = nn.Linear(CFG.CTAF_DIM, CFG.N_STAGES)
+        self.clf_zone   = nn.Linear(CFG.CTAF_DIM, CFG.N_ZONES)
+        self.clf_plus   = nn.Linear(CFG.CTAF_DIM, CFG.N_PLUS)
+
+    def forward(self, x, meta):
+        fused, _, _ = self.backbone(x)
+        Hs = self.proj_s(fused)
+        Hz = self.proj_z(fused)
+        Hp = self.proj_p(fused)
+        Fs, Fz, Fp = self.ctaf(Hs, Hz, Hp)
+        Fs = self.gate_s(self.drop(Fs), meta)
+        Fz = self.gate_z(self.drop(Fz), meta)
+        Fp = self.gate_p(self.drop(Fp), meta)
+        return (self.clf_stage(self.drop(Fs)),
+                self.clf_zone(self.drop(Fz)),
+                self.clf_plus(self.drop(Fp)))
+
+model = MTL_CTAF_ROP().to(device)
+print(f"Params: {sum(p.numel() for p in model.parameters())/1e6:.2f} M")
+
+_x = torch.randn(2, 3, CFG.IMG_SIZE, CFG.IMG_SIZE, device=device)
+_m = torch.randn(2, CFG.META_DIM, device=device)
+with torch.no_grad():
+    ls, lz, lp = model(_x, _m)
+print(f"Stage:{ls.shape} Zone:{lz.shape} Plus:{lp.shape}")
+del _x, _m, ls, lz, lp
+torch.cuda.empty_cache()
+print("Model OK. Ready for training.")
+
+class UncertaintyWeightedLoss(nn.Module):
+    def __init__(self, n=3):
+        super().__init__()
+        self.log_sigma = nn.Parameter(torch.zeros(n))
+    def forward(self, losses):
+        total = sum(torch.exp(-self.log_sigma[i])*L + self.log_sigma[i]
+                    for i, L in enumerate(losses))
+        return total
+
+criterion_stage = nn.CrossEntropyLoss(weight=CFG.STAGE_WEIGHTS.to(device))
+criterion_zone  = nn.CrossEntropyLoss(weight=CFG.ZONE_WEIGHTS.to(device))
+criterion_plus  = nn.CrossEntropyLoss(weight=CFG.PLUS_WEIGHTS.to(device))
+unc_loss        = UncertaintyWeightedLoss().to(device)
+
+print("Loss ready. log_sigma:", unc_loss.log_sigma.cpu().data.numpy())
+
+optimizer = torch.optim.Adam(
+    list(model.parameters()) + list(unc_loss.parameters()),
+    lr=CFG.LR, weight_decay=1e-5)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=CFG.EPOCHS, eta_min=1e-6)
+scaler = torch.cuda.amp.GradScaler()
+print("Optimizer ready.")
+
+def run_epoch(model, loader, train=True):
+    model.train() if train else model.eval()
+    tot_loss = cs = cz = cp = n = 0
+    ctx = torch.enable_grad() if train else torch.no_grad()
+    with ctx:
+        for imgs, metas, sl, zl, pl in loader:
+            imgs  = imgs.to(device);  metas = metas.to(device)
+            sl    = sl.to(device);    zl    = zl.to(device);  pl = pl.to(device)
+            if train: optimizer.zero_grad()
+            with torch.cuda.amp.autocast():
+                ls, lz, lp = model(imgs, metas)
+                loss = unc_loss([criterion_stage(ls, sl),
+                                 criterion_zone(lz, zl),
+                                 criterion_plus(lp, pl)])
+            if train:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer); scaler.update()
+            b = imgs.size(0); n += b; tot_loss += loss.item()*b
+            cs += (ls.argmax(1)==sl).sum().item()
+            cz += (lz.argmax(1)==zl).sum().item()
+            cp += (lp.argmax(1)==pl).sum().item()
+    return dict(loss=tot_loss/n, stage=cs/n, zone=cz/n, plus=cp/n)
+
+best_loss, patience_cnt = float('inf'), 0
+history = []
+
+print(f"{'Ep':>3} | {'TrLoss':>7} {'TrStg':>6} {'TrPls':>6} | "
+      f"{'VaLoss':>7} {'VaStg':>6} {'VaPls':>6}")
+print("─"*55)
+
+for ep in range(1, CFG.EPOCHS+1):
+    tr = run_epoch(model, train_loader, train=True)
+    va = run_epoch(model, val_loader,   train=False)
+    scheduler.step()
+    history.append({'tr':tr,'va':va})
+
+    print(f"{ep:3d} | {tr['loss']:7.4f} {tr['stage']:6.3f} {tr['plus']:6.3f} | "
+          f"{va['loss']:7.4f} {va['stage']:6.3f} {va['plus']:6.3f}", end="")
+
+    if va['loss'] < best_loss:
+        best_loss = va['loss']
+        patience_cnt = 0
+        torch.save({'model': model.state_dict(),
+                    'unc':   unc_loss.state_dict(),
+                    'ep':    ep}, '/kaggle/working/best.pth')
+        print("  ✓")
+    else:
+        patience_cnt += 1
+        print()
+        if patience_cnt >= CFG.PATIENCE:
+            print(f"Early stop at epoch {ep}"); break
+
+print(f"\nBest val loss: {best_loss:.4f}")
+
+# ── CELL 15 : Test Evaluation ─────────────────────────────────────────────────
+
+ckpt = torch.load('/kaggle/working/best.pth', map_location=device)
+model.load_state_dict(ckpt['model'])
+print(f"Loaded best model from epoch {ckpt['ep']}")
+
+model.eval()
+all_ls, all_lz, all_lp = [], [], []
+all_sl, all_zl, all_pl = [], [], []
+
+with torch.no_grad():
+    for imgs, metas, sl, zl, pl in test_loader:
+        imgs  = imgs.to(device)
+        metas = metas.to(device)
+        ls, lz, lp = model(imgs, metas)
+        all_ls.append(ls.argmax(1).cpu())
+        all_lz.append(lz.argmax(1).cpu())
+        all_lp.append(lp.argmax(1).cpu())
+        all_sl.append(sl)
+        all_zl.append(zl)
+        all_pl.append(pl)
+
+pred_s = torch.cat(all_ls).numpy()
+pred_z = torch.cat(all_lz).numpy()
+pred_p = torch.cat(all_lp).numpy()
+true_s = torch.cat(all_sl).numpy()
+true_z = torch.cat(all_zl).numpy()
+true_p = torch.cat(all_pl).numpy()
+
+# ── Overall accuracy ──────────────────────────────────────────────────────────
+print("\n" + "="*50)
+print("FINAL TEST RESULTS")
+print("="*50)
+print(f"Stage accuracy : {(pred_s==true_s).mean()*100:.2f}%")
+print(f"Zone  accuracy : {(pred_z==true_z).mean()*100:.2f}%")
+print(f"Plus  accuracy : {(pred_p==true_p).mean()*100:.2f}%")
+print("="*50)
+
+# ── Per class reports ─────────────────────────────────────────────────────────
+stage_names = ['Stage 0','Stage 1','Stage 2','Stage 3']
+zone_names  = ['Zone I','Zone II','Zone III']
+plus_names  = ['No Plus','Plus']
+
+for preds, trues, names, title in [
+    (pred_s, true_s, stage_names, 'STAGE'),
+    (pred_z, true_z, zone_names,  'ZONE'),
+    (pred_p, true_p, plus_names,  'PLUS DISEASE'),
+]:
+    print(f"\n── {title} Classification Report ──")
+    print(classification_report(trues, preds, target_names=names, digits=4))
+
+    cm = confusion_matrix(trues, preds)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=names, yticklabels=names, ax=ax)
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('True')
+    ax.set_title(f'{title} Confusion Matrix — Test Set')
+    plt.tight_layout()
+    plt.savefig(f'/kaggle/working/cm_{title.lower().replace(" ","_")}.png', dpi=150)
+    plt.show()
+
+# ── AUC ───────────────────────────────────────────────────────────────────────
+print("\n── AUC Scores ──")
+from sklearn.preprocessing import label_binarize
+
+for trues, names, title in [
+    (true_s, stage_names, 'Stage'),
+    (true_z, zone_names,  'Zone'),
+]:
+    try:
+        n = len(names)
+        tb = label_binarize(trues, classes=list(range(n)))
+        # need probabilities — re-run with softmax
+        probs = []
+        model.eval()
+        with torch.no_grad():
+            for imgs, metas, sl, zl, pl in test_loader:
+                imgs = imgs.to(device); metas = metas.to(device)
+                ls, lz, lp = model(imgs, metas)
+                if title == 'Stage':
+                    probs.append(F.softmax(ls, dim=1).cpu())
+                else:
+                    probs.append(F.softmax(lz, dim=1).cpu())
+        probs = torch.cat(probs).numpy()
+        auc = roc_auc_score(tb, probs, multi_class='ovr', average='macro')
+        print(f"{title:10}: AUC = {auc:.4f}")
+    except Exception as e:
+        print(f"{title:10}: AUC failed — {e}")
+
+# Plus AUC (binary)
+try:
+    plus_probs = []
+    model.eval()
+    with torch.no_grad():
+        for imgs, metas, sl, zl, pl in test_loader:
+            imgs = imgs.to(device); metas = metas.to(device)
+            ls, lz, lp = model(imgs, metas)
+            plus_probs.append(F.softmax(lp, dim=1).cpu())
+    plus_probs = torch.cat(plus_probs).numpy()[:, 1]
+    auc = roc_auc_score(true_p, plus_probs)
+    print(f"{'Plus':10}: AUC = {auc:.4f}")
+except Exception as e:
+    print(f"Plus AUC failed — {e}")
+
+# ── Cohen Kappa ───────────────────────────────────────────────────────────────
+print("\n── Cohen's Kappa ──")
+print(f"Stage : κ = {cohen_kappa_score(true_s, pred_s):.4f}")
+print(f"Zone  : κ = {cohen_kappa_score(true_z, pred_z):.4f}")
+print(f"Plus  : κ = {cohen_kappa_score(true_p, pred_p):.4f}")
+
+print("\nAll results saved to /kaggle/working/")
+
