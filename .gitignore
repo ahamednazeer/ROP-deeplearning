@@ -16,8 +16,6 @@ var/
 sdist/
 develop-eggs/
 .installed.cfg
-lib/
-lib64/
 pip-selfcheck.json
 
 # Virtual environments
