@@ -19,9 +19,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code from backend/ subdirectory
 COPY backend/ .
 
-# Copy the pre-trained model from project root into container
-COPY best_rop_model.h5 /app/best_rop_model.h5
-
 # Environment defaults (override at runtime)
 ENV MODEL_PATH=/app/best_rop_model.h5
 ENV DATABASE_URL=sqlite:///./rop.db

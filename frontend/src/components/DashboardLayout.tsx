@@ -14,6 +14,7 @@ import {
   X,
   CaretLeft,
   CaretRight,
+  Images,
 } from '@phosphor-icons/react';
 import type { User } from '@/lib/api';
 import api from '@/lib/api';
@@ -27,6 +28,7 @@ interface NavItem {
 const ADMIN_NAV: NavItem[] = [
   { label: 'Overview', href: '/dashboard/admin', icon: <GaugeIcon size={18} /> },
   { label: 'Users', href: '/dashboard/admin/users', icon: <Users size={18} /> },
+  { label: 'Trained Results', href: '/dashboard/results', icon: <Images size={18} /> },
 ];
 
 const DOCTOR_NAV: NavItem[] = [
@@ -34,6 +36,7 @@ const DOCTOR_NAV: NavItem[] = [
   { label: 'New Scan', href: '/dashboard/doctor/upload', icon: <Upload size={18} /> },
   { label: 'Patients', href: '/dashboard/doctor/patients', icon: <Users size={18} /> },
   { label: 'History', href: '/dashboard/doctor/history', icon: <ClipboardText size={18} /> },
+  { label: 'Trained Results', href: '/dashboard/results', icon: <Images size={18} /> },
 ];
 
 const SIDEBAR_MIN = 56;
